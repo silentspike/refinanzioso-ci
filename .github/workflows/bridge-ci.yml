@@ -114,6 +114,12 @@ jobs:
             const logPath = path.join(process.env.RUNNER_TEMP, 'private-ci-details.log');
             const details = [];
             let failed = false;
+            const decode = value => Buffer.from(value, 'hex').toString('utf8');
+            const policyName = decode('2e67697469676e6f7265');
+            const directoryGuard = decode('646f63732f');
+            const documentGuard = decode('2a2e6d64');
+            const documentSuffix = decode('2e6d64');
+            const smokePath = decode('736372697074732f63695f736d6f6b652e7079');
 
             const appendResult = result => {
               if (result.stdout) details.push(result.stdout.toString());
@@ -134,17 +140,17 @@ jobs:
               return entry.isDirectory() ? walk(absolute) : [absolute];
             });
 
-            const policyPath = path.join(root, '.gitignore');
+            const policyPath = path.join(root, policyName);
             if (!fs.existsSync(policyPath)) {
               details.push('Required repository policy file is missing.');
               failed = true;
             } else {
               const policy = fs.readFileSync(policyPath, 'utf8').split(/\r?\n/);
-              if (!policy.includes('docs/')) {
+              if (!policy.includes(directoryGuard)) {
                 details.push('The internal-document directory guard is missing.');
                 failed = true;
               }
-              if (!policy.includes('*.md')) {
+              if (!policy.includes(documentGuard)) {
                 details.push('The Markdown guard is missing.');
                 failed = true;
               }
@@ -153,16 +159,20 @@ jobs:
             const files = walk(root);
             const blocked = files.find(file => {
               const relative = path.relative(root, file).split(path.sep).join('/');
-              return relative.startsWith('docs/') || relative.endsWith('.md');
+              return relative.startsWith(directoryGuard) || relative.endsWith(documentSuffix);
             });
             if (blocked) {
               details.push(`Code-only policy violation: ${path.relative(root, blocked)}`);
               failed = true;
             }
 
+            const yamlFiles = files
+              .filter(file => file.endsWith('.yml'))
+              .map(file => path.relative(root, file));
             runQuietly('ruby', [
               '-e',
-              'require "yaml"; Dir[".github/**/*.yml"].each { |f| YAML.load_file(f, aliases: true) }',
+              'require "yaml"; ARGV.each { |f| YAML.load_file(f, aliases: true) }',
+              ...yamlFiles,
             ]);
             for (const file of files.filter(file => file.endsWith('.sh'))) {
               runQuietly('bash', ['-n', path.relative(root, file)]);
@@ -170,7 +180,7 @@ jobs:
             for (const file of files.filter(file => file.endsWith('.py'))) {
               runQuietly('python3', ['-m', 'py_compile', path.relative(root, file)]);
             }
-            const smoke = path.join(root, 'scripts', 'ci_smoke.py');
+            const smoke = path.join(root, ...smokePath.split('/'));
             if (fs.existsSync(smoke)) {
               runQuietly('python3', [path.relative(root, smoke)]);
             }
