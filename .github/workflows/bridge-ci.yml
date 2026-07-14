@@ -103,60 +103,82 @@ jobs:
         id: checks
         if: steps.fetch.outcome == 'success'
         continue-on-error: true
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/private-source"
-          log="$RUNNER_TEMP/private-ci-details.log"
-          failed=0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const childProcess = require('child_process');
+            const fs = require('fs');
+            const path = require('path');
 
-          if [[ ! -f .gitignore ]]; then
-            echo 'Required repository policy file is missing.' >> "$log"
-            failed=1
-          else
-            if ! grep -Fxq 'docs/' .gitignore; then
-              echo 'The internal-document directory guard is missing.' >> "$log"
-              failed=1
-            fi
-            if ! grep -Fxq '*.md' .gitignore; then
-              echo 'The Markdown guard is missing.' >> "$log"
-              failed=1
-            fi
-          fi
+            const root = path.join(process.env.RUNNER_TEMP, 'private-source');
+            const logPath = path.join(process.env.RUNNER_TEMP, 'private-ci-details.log');
+            const details = [];
+            let failed = false;
 
-          blocked="$(find . -type f \( -path './docs/*' -o -name '*.md' \) -print -quit)"
-          if [[ -n "$blocked" ]]; then
-            echo "Code-only policy violation: ${blocked}" >> "$log"
-            failed=1
-          fi
+            const appendResult = result => {
+              if (result.stdout) details.push(result.stdout.toString());
+              if (result.stderr) details.push(result.stderr.toString());
+              if (result.status !== 0) failed = true;
+            };
+            const runQuietly = (command, args) => appendResult(childProcess.spawnSync(
+              command,
+              args,
+              {
+                cwd: root,
+                encoding: 'utf8',
+                env: {...process.env, PYTHONDONTWRITEBYTECODE: '1'},
+              },
+            ));
+            const walk = directory => fs.readdirSync(directory, {withFileTypes: true}).flatMap(entry => {
+              const absolute = path.join(directory, entry.name);
+              return entry.isDirectory() ? walk(absolute) : [absolute];
+            });
 
-          if ! ruby -e 'require "yaml"; Dir[".github/**/*.yml"].each { |f| YAML.load_file(f, aliases: true) }' \
-            >> "$log" 2>&1; then
-            echo 'Workflow or issue-form YAML validation failed.' >> "$log"
-            failed=1
-          fi
+            const policyPath = path.join(root, '.gitignore');
+            if (!fs.existsSync(policyPath)) {
+              details.push('Required repository policy file is missing.');
+              failed = true;
+            } else {
+              const policy = fs.readFileSync(policyPath, 'utf8').split(/\r?\n/);
+              if (!policy.includes('docs/')) {
+                details.push('The internal-document directory guard is missing.');
+                failed = true;
+              }
+              if (!policy.includes('*.md')) {
+                details.push('The Markdown guard is missing.');
+                failed = true;
+              }
+            }
 
-          while IFS= read -r -d '' script; do
-            if ! bash -n "$script" >> "$log" 2>&1; then
-              failed=1
-            fi
-          done < <(find . -type f -name '*.sh' -print0)
+            const files = walk(root);
+            const blocked = files.find(file => {
+              const relative = path.relative(root, file).split(path.sep).join('/');
+              return relative.startsWith('docs/') || relative.endsWith('.md');
+            });
+            if (blocked) {
+              details.push(`Code-only policy violation: ${path.relative(root, blocked)}`);
+              failed = true;
+            }
 
-          while IFS= read -r -d '' module; do
-            if ! PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$module" >> "$log" 2>&1; then
-              failed=1
-            fi
-          done < <(find . -type f -name '*.py' -print0)
+            runQuietly('ruby', [
+              '-e',
+              'require "yaml"; Dir[".github/**/*.yml"].each { |f| YAML.load_file(f, aliases: true) }',
+            ]);
+            for (const file of files.filter(file => file.endsWith('.sh'))) {
+              runQuietly('bash', ['-n', path.relative(root, file)]);
+            }
+            for (const file of files.filter(file => file.endsWith('.py'))) {
+              runQuietly('python3', ['-m', 'py_compile', path.relative(root, file)]);
+            }
+            const smoke = path.join(root, 'scripts', 'ci_smoke.py');
+            if (fs.existsSync(smoke)) {
+              runQuietly('python3', [path.relative(root, smoke)]);
+            }
 
-          if [[ -f scripts/ci_smoke.py ]]; then
-            if ! PYTHONDONTWRITEBYTECODE=1 python3 scripts/ci_smoke.py >> "$log" 2>&1; then
-              failed=1
-            fi
-          fi
-
-          if [[ "$failed" != '0' ]]; then
-            exit 1
-          fi
+            fs.writeFileSync(logPath, details.join('\n'), {mode: 0o600});
+            if (failed) {
+              core.setFailed('Private checks failed. Details were retained privately.');
+            }
       - name: Post sanitized private failure details
         if: steps.fetch.outcome == 'failure' || steps.checks.outcome == 'failure'
         env:
