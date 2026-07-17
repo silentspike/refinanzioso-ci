@@ -106,7 +106,7 @@ jobs:
           set -euo pipefail
           repo="$(jq -r '.repo' "$RUNNER_TEMP/bridge-meta.json")"
           sha="$(jq -r '.sha' "$RUNNER_TEMP/bridge-meta.json")"
-          mkdir -p "$RUNNER_TEMP/private-source"
+          mkdir -p "$GITHUB_WORKSPACE/private-source"
           : > "$RUNNER_TEMP/private-ci-details.log"
           curl --silent --show-error --fail --location --retry 2 \
             -H "Authorization: Bearer ${CI_TOKEN}" \
@@ -117,7 +117,7 @@ jobs:
             2>> "$RUNNER_TEMP/private-ci-details.log"
           tar -xzf "$RUNNER_TEMP/private-source.tar.gz" \
             --strip-components=1 \
-            -C "$RUNNER_TEMP/private-source" \
+            -C "$GITHUB_WORKSPACE/private-source" \
             2>> "$RUNNER_TEMP/private-ci-details.log"
       - name: Run requested private checks
         id: checks
@@ -130,7 +130,7 @@ jobs:
             const fs = require('fs');
             const path = require('path');
 
-            const root = path.join(process.env.RUNNER_TEMP, 'private-source');
+            const root = path.join(process.env.GITHUB_WORKSPACE, 'private-source');
             const logPath = path.join(process.env.RUNNER_TEMP, 'private-ci-details.log');
             const meta = JSON.parse(fs.readFileSync(
               path.join(process.env.RUNNER_TEMP, 'bridge-meta.json'),
@@ -290,3 +290,13 @@ jobs:
         run: |
           echo 'Public CI bridge failed. Details were sent to the private repository when a pull request was supplied.'
           exit 1
+      - name: Clean up private source
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace="$(realpath -m -- "$GITHUB_WORKSPACE")"
+          source_root="${workspace}/private-source"
+          [[ -n "$workspace" && "$workspace" != '/' ]]
+          [[ "$source_root" == "${workspace}/private-source" ]]
+          rm -rf -- "$source_root"
