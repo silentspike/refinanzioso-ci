@@ -21,12 +21,20 @@ on:
         description: Private pull request number, or empty for a branch push.
         required: false
         type: string
+      mode:
+        description: Fast pull-request checks or the complete post-merge suite.
+        required: true
+        default: full
+        type: choice
+        options:
+          - fast
+          - full
 
 permissions:
   contents: read
 
 concurrency:
-  group: public-ci-${{ github.event.client_payload.sha || inputs.sha }}
+  group: public-ci-${{ github.event.client_payload.sha || inputs.sha }}-${{ github.event.client_payload.mode || inputs.mode || 'full' }}
   cancel-in-progress: true
 
 jobs:
@@ -44,22 +52,26 @@ jobs:
             sha="$(jq -r '.client_payload.sha // empty' "$GITHUB_EVENT_PATH")"
             ref="$(jq -r '.client_payload.ref // empty' "$GITHUB_EVENT_PATH")"
             pr="$(jq -r '.client_payload.pr // empty' "$GITHUB_EVENT_PATH")"
+            mode="$(jq -r '.client_payload.mode // "full"' "$GITHUB_EVENT_PATH")"
           else
             repo="$(jq -r '.inputs.source_repo // empty' "$GITHUB_EVENT_PATH")"
             sha="$(jq -r '.inputs.sha // empty' "$GITHUB_EVENT_PATH")"
             ref="$(jq -r '.inputs.ref // empty' "$GITHUB_EVENT_PATH")"
             pr="$(jq -r '.inputs.pr // empty' "$GITHUB_EVENT_PATH")"
+            mode="$(jq -r '.inputs.mode // "full"' "$GITHUB_EVENT_PATH")"
           fi
           [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           [[ -n "$ref" ]]
           [[ "$pr" =~ ^[0-9]*$ ]]
+          [[ "$mode" =~ ^(fast|full)$ ]]
           jq -n \
             --arg repo "$repo" \
             --arg sha "$sha" \
             --arg ref "$ref" \
             --arg pr "$pr" \
-            '{repo: $repo, sha: $sha, ref: $ref, pr: $pr}' \
+            --arg mode "$mode" \
+            '{repo: $repo, sha: $sha, ref: $ref, pr: $pr, mode: $mode}' \
             > "$RUNNER_TEMP/bridge-meta.json"
           chmod 600 "$RUNNER_TEMP/bridge-meta.json"
       - name: Mark private status pending
@@ -71,11 +83,19 @@ jobs:
           [[ -n "$CI_TOKEN" ]]
           repo="$(jq -r '.repo' "$RUNNER_TEMP/bridge-meta.json")"
           sha="$(jq -r '.sha' "$RUNNER_TEMP/bridge-meta.json")"
+          mode="$(jq -r '.mode' "$RUNNER_TEMP/bridge-meta.json")"
           GH_TOKEN="$CI_TOKEN" gh api --silent --method POST "repos/${repo}/statuses/${sha}" \
             -f state=pending \
-            -f context='public-ci/build' \
-            -f description='Public CI bridge started' \
+            -f context="public-ci/${mode}" \
+            -f description="Public CI ${mode} checks started" \
             -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [[ "$mode" == 'full' ]]; then
+            GH_TOKEN="$CI_TOKEN" gh api --silent --method POST "repos/${repo}/statuses/${sha}" \
+              -f state=pending \
+              -f context='public-ci/build' \
+              -f description='Public CI full checks started' \
+              -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi
       - name: Fetch private source quietly
         id: fetch
         continue-on-error: true
@@ -99,7 +119,7 @@ jobs:
             --strip-components=1 \
             -C "$RUNNER_TEMP/private-source" \
             2>> "$RUNNER_TEMP/private-ci-details.log"
-      - name: Run quiet structure and lint checks
+      - name: Run requested private checks
         id: checks
         if: steps.fetch.outcome == 'success'
         continue-on-error: true
@@ -112,6 +132,10 @@ jobs:
 
             const root = path.join(process.env.RUNNER_TEMP, 'private-source');
             const logPath = path.join(process.env.RUNNER_TEMP, 'private-ci-details.log');
+            const meta = JSON.parse(fs.readFileSync(
+              path.join(process.env.RUNNER_TEMP, 'bridge-meta.json'),
+              'utf8',
+            ));
             const details = [];
             let failed = false;
             const decode = value => Buffer.from(value, 'hex').toString('utf8');
@@ -181,7 +205,7 @@ jobs:
               runQuietly('python3', ['-m', 'py_compile', path.relative(root, file)]);
             }
             const smoke = path.join(root, ...smokePath.split('/'));
-            if (fs.existsSync(smoke)) {
+            if (meta.mode === 'full' && fs.existsSync(smoke)) {
               runQuietly('python3', [path.relative(root, smoke)]);
             }
 
@@ -199,6 +223,7 @@ jobs:
           repo="$(jq -r '.repo' "$RUNNER_TEMP/bridge-meta.json")"
           sha="$(jq -r '.sha' "$RUNNER_TEMP/bridge-meta.json")"
           pr="$(jq -r '.pr' "$RUNNER_TEMP/bridge-meta.json")"
+          mode="$(jq -r '.mode' "$RUNNER_TEMP/bridge-meta.json")"
           if [[ -z "$pr" ]]; then
             exit 0
           fi
@@ -215,7 +240,7 @@ jobs:
             echo 'Bridge infrastructure step failed without diagnostic output.' > "$sanitized"
           fi
           {
-            echo "Public CI bridge failed for \`${sha}\`."
+            echo "Public CI ${mode} checks failed for \`${sha}\`."
             echo
             echo 'Detailed output is available only in this private pull request:'
             echo
@@ -236,21 +261,29 @@ jobs:
           set -euo pipefail
           repo="$(jq -r '.repo' "$RUNNER_TEMP/bridge-meta.json")"
           sha="$(jq -r '.sha' "$RUNNER_TEMP/bridge-meta.json")"
+          mode="$(jq -r '.mode' "$RUNNER_TEMP/bridge-meta.json")"
           if [[ "${{ steps.fetch.outcome }}" != 'success' ]]; then
             state=error
-            description='Public CI bridge infrastructure failed'
+            description="Public CI ${mode} infrastructure failed"
           elif [[ "${{ steps.checks.outcome }}" != 'success' ]]; then
             state=failure
-            description='Public CI bridge failed; private PR has details'
+            description="Public CI ${mode} failed; private PR has details"
           else
             state=success
-            description='Public CI bridge passed'
+            description="Public CI ${mode} checks passed"
           fi
           GH_TOKEN="$CI_TOKEN" gh api --silent --method POST "repos/${repo}/statuses/${sha}" \
             -f state="$state" \
-            -f context='public-ci/build' \
+            -f context="public-ci/${mode}" \
             -f description="$description" \
             -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [[ "$mode" == 'full' ]]; then
+            GH_TOKEN="$CI_TOKEN" gh api --silent --method POST "repos/${repo}/statuses/${sha}" \
+              -f state="$state" \
+              -f context='public-ci/build' \
+              -f description="$description" \
+              -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi
       - name: Enforce bridge result
         if: steps.fetch.outcome != 'success' || steps.checks.outcome != 'success'
         shell: bash
