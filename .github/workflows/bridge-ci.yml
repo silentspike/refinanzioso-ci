@@ -13,6 +13,10 @@ on:
         description: Exact source commit SHA.
         required: true
         type: string
+      base_sha:
+        description: Exact private comparison base SHA.
+        required: false
+        type: string
       ref:
         description: Source ref for traceability.
         required: true
@@ -34,7 +38,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: public-ci-${{ github.event.client_payload.sha || inputs.sha }}-${{ github.event.client_payload.mode || inputs.mode || 'full' }}
+  group: public-ci-${{ github.event.client_payload.source_repo || inputs.source_repo }}-${{ github.event.client_payload.mode || inputs.mode || 'full' }}-${{ github.event.client_payload.pr || inputs.pr || github.event.client_payload.ref || inputs.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -50,28 +54,35 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == 'repository_dispatch' ]]; then
             repo="$(jq -r '.client_payload.source_repo // empty' "$GITHUB_EVENT_PATH")"
             sha="$(jq -r '.client_payload.sha // empty' "$GITHUB_EVENT_PATH")"
+            base_sha="$(jq -r '.client_payload.base_sha // empty' "$GITHUB_EVENT_PATH")"
             ref="$(jq -r '.client_payload.ref // empty' "$GITHUB_EVENT_PATH")"
             pr="$(jq -r '.client_payload.pr // empty' "$GITHUB_EVENT_PATH")"
             mode="$(jq -r '.client_payload.mode // "full"' "$GITHUB_EVENT_PATH")"
           else
             repo="$(jq -r '.inputs.source_repo // empty' "$GITHUB_EVENT_PATH")"
             sha="$(jq -r '.inputs.sha // empty' "$GITHUB_EVENT_PATH")"
+            base_sha="$(jq -r '.inputs.base_sha // empty' "$GITHUB_EVENT_PATH")"
             ref="$(jq -r '.inputs.ref // empty' "$GITHUB_EVENT_PATH")"
             pr="$(jq -r '.inputs.pr // empty' "$GITHUB_EVENT_PATH")"
             mode="$(jq -r '.inputs.mode // "full"' "$GITHUB_EVENT_PATH")"
           fi
+          if [[ -z "$base_sha" ]]; then
+            base_sha="$sha"
+          fi
           [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
           [[ -n "$ref" ]]
           [[ "$pr" =~ ^[0-9]*$ ]]
           [[ "$mode" =~ ^(fast|full)$ ]]
           jq -n \
             --arg repo "$repo" \
             --arg sha "$sha" \
+            --arg base_sha "$base_sha" \
             --arg ref "$ref" \
             --arg pr "$pr" \
             --arg mode "$mode" \
-            '{repo: $repo, sha: $sha, ref: $ref, pr: $pr, mode: $mode}' \
+            '{repo: $repo, sha: $sha, base_sha: $base_sha, ref: $ref, pr: $pr, mode: $mode, force_all: false}' \
             > "$RUNNER_TEMP/bridge-meta.json"
           chmod 600 "$RUNNER_TEMP/bridge-meta.json"
       - name: Mark private status pending
@@ -119,6 +130,36 @@ jobs:
             --strip-components=1 \
             -C "$GITHUB_WORKSPACE/private-source" \
             2>> "$RUNNER_TEMP/private-ci-details.log"
+          force_all=false
+          : > "$RUNNER_TEMP/private-changed-files.json"
+          if [[ "$base_sha" == '0000000000000000000000000000000000000000' || "$base_sha" == "$sha" ]]; then
+            force_all=true
+          elif ! GH_TOKEN="$CI_TOKEN" gh api \
+              "repos/${repo}/compare/${base_sha}...${sha}" \
+              > "$RUNNER_TEMP/private-compare.json" \
+              2>> "$RUNNER_TEMP/private-ci-details.log"; then
+            force_all=true
+          elif ! jq -e '.files | type == "array"' \
+              "$RUNNER_TEMP/private-compare.json" >/dev/null; then
+            force_all=true
+          elif (( $(jq '.files | length' "$RUNNER_TEMP/private-compare.json") >= 300 )); then
+            force_all=true
+          else
+            jq '[.files[].filename]' "$RUNNER_TEMP/private-compare.json" \
+              > "$RUNNER_TEMP/private-changed-files.json"
+          fi
+          if [[ ! -s "$RUNNER_TEMP/private-changed-files.json" ]]; then
+            echo '[]' > "$RUNNER_TEMP/private-changed-files.json"
+          fi
+          jq --argjson force_all "$force_all" '.force_all = $force_all' \
+            "$RUNNER_TEMP/bridge-meta.json" \
+            > "$RUNNER_TEMP/bridge-meta.next.json"
+          mv "$RUNNER_TEMP/bridge-meta.next.json" "$RUNNER_TEMP/bridge-meta.json"
+      - name: Set up private runtime
+        if: steps.fetch.outcome == 'success'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
       - name: Run requested private checks
         id: checks
         if: steps.fetch.outcome == 'success'
@@ -132,6 +173,7 @@ jobs:
 
             const root = path.join(process.env.GITHUB_WORKSPACE, 'private-source');
             const logPath = path.join(process.env.RUNNER_TEMP, 'private-ci-details.log');
+            const changedPath = path.join(process.env.RUNNER_TEMP, 'private-changed-files.json');
             const meta = JSON.parse(fs.readFileSync(
               path.join(process.env.RUNNER_TEMP, 'bridge-meta.json'),
               'utf8',
@@ -201,12 +243,20 @@ jobs:
             for (const file of files.filter(file => file.endsWith('.sh'))) {
               runQuietly('bash', ['-n', path.relative(root, file)]);
             }
-            for (const file of files.filter(file => file.endsWith('.py'))) {
-              runQuietly('python3', ['-m', 'py_compile', path.relative(root, file)]);
-            }
             const smoke = path.join(root, ...smokePath.split('/'));
-            if (meta.mode === 'full' && fs.existsSync(smoke)) {
-              runQuietly('python3', [path.relative(root, smoke)]);
+            if (fs.existsSync(smoke)) {
+              const args = [
+                path.relative(root, smoke),
+                '--mode',
+                meta.mode,
+                '--changed-files-json',
+                changedPath,
+              ];
+              if (meta.force_all) args.push('--force-all');
+              runQuietly('python', args);
+            } else {
+              details.push('Required private product runner is missing.');
+              failed = true;
             }
 
             fs.writeFileSync(logPath, details.join('\n'), {mode: 0o600});
@@ -224,6 +274,14 @@ jobs:
           sha="$(jq -r '.sha' "$RUNNER_TEMP/bridge-meta.json")"
           pr="$(jq -r '.pr' "$RUNNER_TEMP/bridge-meta.json")"
           mode="$(jq -r '.mode' "$RUNNER_TEMP/bridge-meta.json")"
+          if [[ -z "$pr" ]]; then
+            pr="$(GH_TOKEN="$CI_TOKEN" gh api \
+              -H 'Accept: application/vnd.github+json' \
+              "repos/${repo}/commits/${sha}/pulls" \
+              --jq '[.[] | select(.merged_at != null)] | sort_by(.merged_at) | last | .number // empty' \
+              2>/dev/null || true)"
+          fi
+          printf '%s' "$pr" > "$RUNNER_TEMP/private-diagnostic-target"
           if [[ -z "$pr" ]]; then
             exit 0
           fi
@@ -267,7 +325,11 @@ jobs:
             description="Public CI ${mode} infrastructure failed"
           elif [[ "${{ steps.checks.outcome }}" != 'success' ]]; then
             state=failure
-            description="Public CI ${mode} failed; private PR has details"
+            if [[ -s "$RUNNER_TEMP/private-diagnostic-target" ]]; then
+              description="Public CI ${mode} failed; private PR has details"
+            else
+              description="Public CI ${mode} failed; no private PR was resolved"
+            fi
           else
             state=success
             description="Public CI ${mode} checks passed"
