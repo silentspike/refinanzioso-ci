@@ -105,15 +105,20 @@ jobs:
             -f context="public-ci/${mode}" \
             -f description="Public CI ${mode} checks started" \
             -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          if [[ -n "$(jq -r '.pr' "$RUNNER_TEMP/bridge-meta.json")" ]]; then
-            for context in pr-title-check secret-scan language-check risk-policy issue-contract broken-dev-policy; do
+          pr="$(jq -r '.pr' "$RUNNER_TEMP/bridge-meta.json")"
+          required_contexts=()
+          if [[ -n "$pr" ]]; then
+            required_contexts=(pr-title-check secret-scan language-check risk-policy issue-contract broken-dev-policy)
+          elif [[ "$mode" == 'full' ]]; then
+            required_contexts=(secret-scan language-check)
+          fi
+          for context in "${required_contexts[@]}"; do
               GH_TOKEN="$CI_TOKEN" gh api --silent --method POST "repos/${repo}/statuses/${sha}" \
                 -f state=pending \
                 -f context="$context" \
                 -f description="Public bridge ${context} started" \
                 -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            done
-          fi
+          done
           if [[ "$mode" == 'full' ]]; then
             GH_TOKEN="$CI_TOKEN" gh api --silent --method POST "repos/${repo}/statuses/${sha}" \
               -f state=pending \
@@ -408,8 +413,13 @@ jobs:
           mode="$(jq -r '.mode' "$RUNNER_TEMP/bridge-meta.json")"
           pr="$(jq -r '.pr' "$RUNNER_TEMP/bridge-meta.json")"
           target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          required_contexts=()
           if [[ -n "$pr" ]]; then
-            for context in pr-title-check secret-scan language-check risk-policy issue-contract broken-dev-policy; do
+            required_contexts=(pr-title-check secret-scan language-check risk-policy issue-contract broken-dev-policy)
+          elif [[ "$mode" == 'full' ]]; then
+            required_contexts=(secret-scan language-check)
+          fi
+          for context in "${required_contexts[@]}"; do
               if jq -e --arg context "$context" '.[$context].state | IN("success", "failure", "error")' \
                   "$RUNNER_TEMP/private-required-results.json" >/dev/null 2>&1; then
                 context_state="$(jq -r --arg context "$context" '.[$context].state' "$RUNNER_TEMP/private-required-results.json")"
@@ -423,8 +433,7 @@ jobs:
                 -f context="$context" \
                 -f description="$context_description" \
                 -f target_url="$target_url"
-            done
-          fi
+          done
           if [[ "${{ steps.fetch.outcome }}" != 'success' ]]; then
             state=error
             description="Public CI ${mode} infrastructure failed"

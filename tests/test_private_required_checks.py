@@ -31,6 +31,13 @@ class PrivateRequiredChecksTests(unittest.TestCase):
         self.assertIn("--require-hashes", workflow)
         self.assertIn("private-source/requirements/runtime.lock", workflow)
 
+    def test_full_mode_publishes_secret_and_language_statuses(self) -> None:
+        workflow = (Path(__file__).parents[1] / ".github/workflows/bridge-ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(workflow.count("required_contexts=(secret-scan language-check)"), 2)
+        self.assertIn("for context in \"${required_contexts[@]}\"", workflow)
+
     def test_title_requires_conventional_commit_shape(self) -> None:
         check_title(event(title="fix(collectors): restore runtime"))
         with self.assertRaises(CheckFailure):
