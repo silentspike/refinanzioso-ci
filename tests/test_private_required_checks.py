@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import unittest
 
 from scripts.private_required_checks import (
@@ -22,6 +23,14 @@ def event(*, title: str = "fix(ci): test", labels: tuple[str, ...] = ()) -> dict
 
 
 class PrivateRequiredChecksTests(unittest.TestCase):
+    def test_workflow_installs_hash_locked_private_runtime(self) -> None:
+        workflow = (Path(__file__).parents[1] / ".github/workflows/bridge-ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Install pinned private runtime", workflow)
+        self.assertIn("--require-hashes", workflow)
+        self.assertIn("private-source/requirements/runtime.lock", workflow)
+
     def test_title_requires_conventional_commit_shape(self) -> None:
         check_title(event(title="fix(collectors): restore runtime"))
         with self.assertRaises(CheckFailure):
