@@ -222,6 +222,14 @@ jobs:
             --disable-pip-version-check \
             --require-hashes \
             --requirement "$GITHUB_WORKSPACE/private-source/requirements/runtime.lock"
+      - name: Install PDF text runtime
+        if: steps.fetch.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends poppler-utils
+          command -v pdftotext
       - name: Install pinned secret scanner
         if: steps.fetch.outcome == 'success'
         shell: bash
